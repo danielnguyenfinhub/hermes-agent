@@ -1,118 +1,135 @@
 #!/usr/bin/env python3
 """
-Hermes MCP HTTP Server — exposes 10 Hermes messaging tools via HTTP/SSE
-for remote MCP clients like Claude.ai.
+Hermes Combined HTTP Server — port 3000
 
-Starts alongside the Hermes gateway (Telegram, Discord, etc.) and provides
-HTTP access to conversations, messages, and platform channels.
+Serves both:
+  1. MCP SSE endpoints (/sse, /messages/) for Claude.ai
+  2. Reverse proxy for /telegram to Hermes gateway on internal port 3001
 
-Tools exposed:
-  conversations_list, conversation_get, messages_read, attachments_fetch,
-  events_poll, events_wait, messages_send, channels_list,
-  permissions_list_open, permissions_respond
-
-Usage:
-    MCP_PORT=8080 python mcp_http_serve.py
+This allows a single Railway domain to handle both MCP and Telegram.
 """
 import os
 import sys
 import logging
+import asyncio
+import httpx
 
-# Ensure Hermes source is importable
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from mcp_serve import create_mcp_server, EventBridge
+logger = logging.getLogger("hermes.combined")
 
-logger = logging.getLogger("hermes.mcp_http")
+GATEWAY_PORT = int(os.environ.get("GATEWAY_INTERNAL_PORT", "3001"))
+SERVER_PORT = int(os.environ.get("PORT", "3000"))
 
 
 def main():
-    port = int(os.environ.get("MCP_PORT", "8080"))
-    host = "0.0.0.0"
-
     logging.basicConfig(
         level=logging.INFO,
         stream=sys.stderr,
         format="%(asctime)s [%(name)s] %(levelname)s: %(message)s",
     )
-    logger.info("Starting Hermes MCP HTTP server on %s:%d", host, port)
-
-    bridge = EventBridge()
-    bridge.start()
-
-    mcp = create_mcp_server(event_bridge=bridge)
-
-    # Configure host/port for SSE transport
-    try:
-        settings = getattr(mcp, "settings", getattr(mcp, "_settings", None))
-        if settings is not None:
-            settings.host = host
-            settings.port = port
-    except Exception as e:
-        logger.warning("Could not set FastMCP settings: %s", e)
-
-    try:
-        # FastMCP.run(transport="sse") starts a uvicorn SSE server
-        mcp.run(transport="sse")
-    except TypeError:
-        # Older mcp versions may not support transport arg — fall back
-        logger.info("Falling back to manual SSE server")
-        _run_manual_sse(mcp, host, port)
-    finally:
-        bridge.stop()
-
-
-def _run_manual_sse(mcp, host: str, port: int):
-    """Fallback: manually create SSE transport with CORS support."""
-    import asyncio
 
     try:
         import uvicorn
         from starlette.applications import Starlette
         from starlette.routing import Route, Mount
-        from starlette.responses import JSONResponse
-    except ImportError:
-        logger.error("uvicorn/starlette not installed — cannot start HTTP server")
+        from starlette.responses import JSONResponse, Response
+        from starlette.requests import Request
+        from starlette.middleware.cors import CORSMiddleware
+    except ImportError as e:
+        logger.error("Missing dependency: %s", e)
         sys.exit(1)
 
-    from mcp.server.sse import SseServerTransport
+    # --- MCP Server setup ---
+    mcp_server = None
+    sse_transport = None
+    try:
+        from mcp_serve import create_mcp_server, EventBridge
+        from mcp.server.sse import SseServerTransport
 
-    sse = SseServerTransport("/messages/")
-    server = mcp._mcp_server
+        bridge = EventBridge()
+        bridge.start()
+        mcp_obj = create_mcp_server(event_bridge=bridge)
+        mcp_server = mcp_obj._mcp_server
+        sse_transport = SseServerTransport("/messages/")
+        logger.info("MCP server initialized with 10 tools")
+    except Exception as e:
+        logger.error("Failed to init MCP server: %s", e)
+        logger.info("Will run as proxy-only (no MCP)")
 
-    async def handle_sse(request):
-        async with sse.connect_sse(
+    # --- Route handlers ---
+    async def handle_sse(request: Request):
+        if not sse_transport or not mcp_server:
+            return JSONResponse({"error": "MCP not available"}, status_code=503)
+        async with sse_transport.connect_sse(
             request.scope, request.receive, request._send
         ) as (read_stream, write_stream):
-            await server.run(
-                read_stream, write_stream, server.create_initialization_options()
+            await mcp_server.run(
+                read_stream, write_stream, mcp_server.create_initialization_options()
             )
 
-    async def health(request):
-        return JSONResponse({"status": "ok", "server": "hermes-mcp", "tools": 10})
+    async def health(request: Request):
+        return JSONResponse({
+            "status": "ok",
+            "server": "hermes-combined",
+            "mcp_tools": 10 if mcp_server else 0,
+            "gateway_port": GATEWAY_PORT,
+        })
 
-    app = Starlette(
-        routes=[
-            Route("/health", endpoint=health),
-            Route("/sse", endpoint=handle_sse),
-            Mount("/messages/", app=sse.handle_post_message),
-        ]
+    async def proxy_to_gateway(request: Request):
+        """Reverse proxy any request to the Hermes gateway on internal port."""
+        target = f"http://127.0.0.1:{GATEWAY_PORT}{request.url.path}"
+        body = await request.body()
+        headers = dict(request.headers)
+        headers.pop("host", None)
+
+        try:
+            async with httpx.AsyncClient(timeout=30.0) as client:
+                resp = await client.request(
+                    method=request.method,
+                    url=target,
+                    content=body,
+                    headers=headers,
+                )
+                return Response(
+                    content=resp.content,
+                    status_code=resp.status_code,
+                    headers=dict(resp.headers),
+                )
+        except httpx.ConnectError:
+            logger.error("Gateway not reachable at port %d", GATEWAY_PORT)
+            return JSONResponse(
+                {"error": "Gateway not ready"},
+                status_code=502,
+            )
+        except Exception as e:
+            logger.error("Proxy error: %s", e)
+            return JSONResponse({"error": str(e)}, status_code=502)
+
+    # Build routes
+    routes = [
+        Route("/health", endpoint=health),
+        Route("/telegram", endpoint=proxy_to_gateway, methods=["GET", "POST"]),
+        Route("/telegram/{path:path}", endpoint=proxy_to_gateway, methods=["GET", "POST"]),
+    ]
+
+    if sse_transport:
+        routes.append(Route("/sse", endpoint=handle_sse))
+        routes.append(Mount("/messages/", app=sse_transport.handle_post_message))
+
+    app = Starlette(routes=routes)
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=["*"],
+        allow_methods=["*"],
+        allow_headers=["*"],
     )
 
-    # Add CORS middleware
-    try:
-        from starlette.middleware.cors import CORSMiddleware
+    logger.info("Starting combined server on 0.0.0.0:%d", SERVER_PORT)
+    logger.info("  MCP: /sse, /messages/")
+    logger.info("  Telegram proxy: /telegram -> 127.0.0.1:%d", GATEWAY_PORT)
 
-        app.add_middleware(
-            CORSMiddleware,
-            allow_origins=["*"],
-            allow_methods=["*"],
-            allow_headers=["*"],
-        )
-    except ImportError:
-        logger.warning("CORS middleware unavailable")
-
-    uvicorn.run(app, host=host, port=port)
+    uvicorn.run(app, host="0.0.0.0", port=SERVER_PORT)
 
 
 if __name__ == "__main__":

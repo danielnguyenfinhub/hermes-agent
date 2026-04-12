@@ -1,13 +1,15 @@
 #!/bin/bash
-# Docker entrypoint: bootstrap config files into the mounted volume, then run hermes.
+# Docker entrypoint: bootstrap config files into the mounted volume, then run.
+# Combined architecture:
+#   - Port 3000: Combined HTTP server (MCP SSE + Telegram proxy)
+#   - Port 3001: Hermes gateway (internal only, proxied via combined server)
 set -e
 
 HERMES_HOME="/opt/data"
 INSTALL_DIR="/opt/hermes"
+GATEWAY_INTERNAL_PORT="${GATEWAY_INTERNAL_PORT:-3001}"
 
 # --- Privilege dropping via gosu ---
-# When started as root (the default), optionally remap the hermes user/group
-# to match host-side ownership, fix volume permissions, then re-exec as hermes.
 if [ "$(id -u)" = "0" ]; then
     if [ -n "$HERMES_UID" ] && [ "$HERMES_UID" != "$(id -u hermes)" ]; then
         echo "Changing hermes UID to $HERMES_UID"
@@ -32,13 +34,6 @@ fi
 # --- Running as hermes from here ---
 source "${INSTALL_DIR}/.venv/bin/activate"
 
-# Create essential directory structure.  Cache and platform directories
-# (cache/images, cache/audio, platforms/whatsapp, etc.) are created on
-# demand by the application — don't pre-create them here so new installs
-# get the consolidated layout from get_hermes_dir().
-# The "home/" subdirectory is a per-profile HOME for subprocesses (git,
-# ssh, gh, npm …).  Without it those tools write to /root which is
-# ephemeral and shared across profiles.  See issue #4426.
 mkdir -p "$HERMES_HOME"/{cron,sessions,logs,hooks,memories,skills,skins,plans,workspace,home}
 
 # .env
@@ -56,17 +51,25 @@ if [ ! -f "$HERMES_HOME/SOUL.md" ]; then
     cp "$INSTALL_DIR/docker/SOUL.md" "$HERMES_HOME/SOUL.md"
 fi
 
-# Sync bundled skills (manifest-based so user edits are preserved)
+# Sync bundled skills
 if [ -d "$INSTALL_DIR/skills" ]; then
     python3 "$INSTALL_DIR/tools/skills_sync.py"
 fi
 
-# --- Start MCP HTTP server in background (if MCP_PORT is set) ---
-if [ -n "$MCP_PORT" ]; then
-    echo "Starting Hermes MCP HTTP server on port $MCP_PORT..."
-    python3 "$INSTALL_DIR/mcp_http_serve.py" &
-    MCP_PID=$!
-    echo "MCP HTTP server started (PID $MCP_PID)"
-fi
+# --- Architecture ---
+# 1. Start Hermes gateway on internal port 3001 (background)
+# 2. Start combined HTTP server on port 3000 (foreground)
+#    - Serves MCP at /sse and /messages/ for Claude.ai
+#    - Proxies /telegram to gateway on 3001
 
-exec hermes "$@"
+echo "Starting Hermes gateway on internal port $GATEWAY_INTERNAL_PORT..."
+export TELEGRAM_WEBHOOK_PORT="$GATEWAY_INTERNAL_PORT"
+hermes gateway &
+GATEWAY_PID=$!
+echo "Gateway started (PID $GATEWAY_PID)"
+
+# Give gateway a moment to start
+sleep 2
+
+echo "Starting combined HTTP server on port ${PORT:-3000}..."
+exec python3 "$INSTALL_DIR/mcp_http_serve.py"
