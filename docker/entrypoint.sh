@@ -1,8 +1,11 @@
 #!/bin/bash
-# Docker entrypoint: bootstrap config files into the mounted volume, then run.
-# Combined architecture:
-#   - Port 3000: Combined HTTP server (MCP SSE + Telegram proxy)
-#   - Port 3001: Hermes gateway (internal only, proxied via combined server)
+# Docker entrypoint: bootstrap config files, then run combined server.
+#
+# Architecture:
+#   Port 3000 (public): Combined HTTP server
+#     - /sse + /messages  → MCP for Claude.ai
+#     - /telegram         → proxied to Hermes gateway on port 3001
+#   Port 3001 (internal): Hermes gateway (Telegram webhook handler)
 set -e
 
 HERMES_HOME="/opt/data"
@@ -53,23 +56,28 @@ fi
 
 # Sync bundled skills
 if [ -d "$INSTALL_DIR/skills" ]; then
-    python3 "$INSTALL_DIR/tools/skills_sync.py"
+    python3 "$INSTALL_DIR/tools/skills_sync.py" || echo "Skills sync skipped"
 fi
 
-# --- Architecture ---
-# 1. Start Hermes gateway on internal port 3001 (background)
-# 2. Start combined HTTP server on port 3000 (foreground)
-#    - Serves MCP at /sse and /messages/ for Claude.ai
-#    - Proxies /telegram to gateway on 3001
-
+# --- Start services ---
+echo "=== Hermes Combined Server ==="
 echo "Starting Hermes gateway on internal port $GATEWAY_INTERNAL_PORT..."
+
+# Override webhook port for internal use
 export TELEGRAM_WEBHOOK_PORT="$GATEWAY_INTERNAL_PORT"
+
+# Start gateway in background
 hermes gateway &
 GATEWAY_PID=$!
 echo "Gateway started (PID $GATEWAY_PID)"
 
-# Give gateway a moment to start
-sleep 2
+# Brief pause for gateway init
+sleep 3
 
 echo "Starting combined HTTP server on port ${PORT:-3000}..."
+echo "  MCP: /sse + /messages"
+echo "  Telegram: /telegram -> localhost:$GATEWAY_INTERNAL_PORT"
+echo "  Health: /health"
+
+# Run combined server in foreground
 exec python3 "$INSTALL_DIR/mcp_http_serve.py"
