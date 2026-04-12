@@ -61,4 +61,12 @@ if [ -d "$INSTALL_DIR/skills" ]; then
     python3 "$INSTALL_DIR/tools/skills_sync.py"
 fi
 
+# --- Start MCP HTTP server in background (if MCP_PORT is set) ---
+if [ -n "$MCP_PORT" ]; then
+    echo "Starting Hermes MCP HTTP server on port $MCP_PORT..."
+    python3 "$INSTALL_DIR/mcp_http_serve.py" &
+    MCP_PID=$!
+    echo "MCP HTTP server started (PID $MCP_PID)"
+fi
+
 exec hermes "$@"
