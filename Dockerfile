@@ -9,6 +9,10 @@ ENV PYTHONUNBUFFERED=1
 # install survives the /opt/data volume overlay at runtime.
 ENV PLAYWRIGHT_BROWSERS_PATH=/opt/hermes/.playwright
 
+# Add the venv to PATH so `hermes` is always found
+ENV PATH="/opt/hermes/.venv/bin:$PATH"
+ENV VIRTUAL_ENV="/opt/hermes/.venv"
+
 # Install system dependencies in one layer, clear APT cache
 RUN apt-get update && \
     apt-get install -y --no-install-recommends \
